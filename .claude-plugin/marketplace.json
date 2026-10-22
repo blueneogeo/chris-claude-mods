@@ -1,0 +1,12 @@
+{
+  "name": "christian-mods",
+  "owner": { "name": "Christian Vogel" },
+  "metadata": { "description": "Christian's own Claude Code mods." },
+  "plugins": [
+    {
+      "name": "cls",
+      "source": "./cls",
+      "description": "/cls clears the screen and shows a short status: goal, done, now, issues, next, running agents and shells."
+    }
+  ]
+}
