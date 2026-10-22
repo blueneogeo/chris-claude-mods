@@ -1,4 +1,7 @@
+import { atom, read, update } from 'claude-code'
 import type { Register, SessionMessage } from 'claude-code'
+
+import type { Shell } from '../types'
 
 const PROMPT = `Mental reset. The reader looked away for a while and is coming back to this session cold. Write a status they can take in at a glance.
 
@@ -11,6 +14,7 @@ NEXT: the concrete next steps (1-3 bullets)
 Each bullet starts with "- ".
 
 Rules:
+- Plain text only: no markdown tables, headings or bold; bullets only.
 - Brief: one short sentence per bullet, at most about 15 words. Under 130 words in total.
 - Grounded: only state what actually happened in this session. Name the real file, command, decision or result; never guess or pad. If something is unclear or undecided, say so.
 - Easy to read: plain everyday words, active voice, no jargon or internal ids unless the reader needs them. Lead each bullet with the point, not the background.
@@ -22,30 +26,46 @@ Rules:
 // and terminal size.
 const room = new Map<string, { room: number; card: number }>()
 
-type Shell = { id: string; command: string; description?: string }
+// The background shells Claude Code reported in flight when a turn last
+// stopped: its own list, so a shell from before a resume or one that ended
+// never shows.
+const inFlight = atom({ plugin: 'cls', key: 'shells' } as const, [])
 
-// Background shells still running, read back from the transcript: a Bash call
-// that went to the background, with no later notification or stop naming it.
-const runningShells = (messages: readonly SessionMessage[]): Shell[] => {
-  const shells = new Map<string, Shell>()
+// The shells of that list still running: one whose end reached the
+// transcript since (a task notification or a stop naming it) is left out.
+const runningShells = (known: readonly Shell[], messages: readonly SessionMessage[]): Shell[] => {
+  const ended = new Set<string>()
   for (const message of messages) {
     for (const use of message.toolUses) {
-      const input = use.input as { command?: string; description?: string; task_id?: string; shell_id?: string }
-      if (use.tool === 'Bash') {
-        const id =
-          (use.result as { backgroundTaskId?: string } | undefined)?.backgroundTaskId ??
-          /running in background with ID: (\w+)/.exec(use.text ?? '')?.[1]
-        if (id) shells.set(id, { id, command: input.command ?? '', description: input.description })
-      }
-      if (use.tool === 'TaskStop' && !use.isError) shells.delete(input.task_id ?? input.shell_id ?? '')
+      const input = use.input as { task_id?: string; shell_id?: string }
+      if (use.tool === 'TaskStop' && !use.isError) ended.add(input.task_id ?? input.shell_id ?? '')
     }
-    for (const id of shells.keys()) {
-      if (message.text.includes(`<task-id>${id}</task-id>`)) shells.delete(id)
+    for (const shell of known) {
+      if (message.text.includes(shell.id) && /<task-id>|completed|failed|killed|stopped/.test(message.text)) {
+        ended.add(shell.id)
+      }
     }
   }
 
-  return [...shells.values()]
+  return known.filter(shell => !ended.has(shell.id))
 }
+
+// Other mods restyle a command's output: skins draws two "key: value" lines
+// in a row, or a markdown table, as a table card of its own, and the status
+// box is never drawn. So a bullet's first ": " becomes " — ", and a table's
+// rows become bullets.
+const plain = (text: string): string =>
+  text
+    .split('\n')
+    .filter(line => !/^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(line))
+    .map(line => {
+      const row = /^\s*\|(.*)\|\s*$/.exec(line)
+      const bullet = row
+        ? `- ${(row[1] ?? "").split('|').map(cell => cell.trim()).filter(Boolean).join(' — ')}`
+        : line
+      return /^\s*(GOAL|DONE|NOW|ISSUES|NEXT|AGENTS|SHELLS)\b/.test(bullet) ? bullet : bullet.replace(/:\s+/, ' — ')
+    })
+    .join('\n')
 
 // The conversation as plain text for a summary, newest kept when too long.
 const LIMIT = 150_000
@@ -73,6 +93,15 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('classic.Stop', async ($, e, next) => {
+    const shells = (e.background_tasks ?? [])
+      .filter(task => task.type === 'shell' && ['running', 'pending'].includes(task.status))
+      .map(task => ({ id: task.id, command: task.command ?? '', description: task.description }))
+    await update($, inFlight, () => shells)
+
+    return next(e)
+  })
+
   on('command.run', { command: 'cls' }, async $ => {
     $.ui.status('cls: summarising…')
     let reply
@@ -81,7 +110,7 @@ export const register: Register = on => {
         ['pending', 'running', 'waiting'].includes(a.status),
       )
       const messages = await $.session.messages()
-      const shells = runningShells(messages)
+      const shells = runningShells(await read($, inFlight), messages)
       const extra = [
         agents.length > 0 &&
           `AGENTS: one bullet per agent below, in this form: "<name>: <what it is actually working on and why, in plain words>":\n` +
@@ -119,7 +148,7 @@ export const register: Register = on => {
       }
     }
 
-    return { text: reply.text.trim() }
+    return { text: plain(reply.text.trim()) }
   })
 
   // Draw the status as three segments at the top, padded with blank rows to
