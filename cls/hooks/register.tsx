@@ -47,6 +47,22 @@ const runningShells = (messages: readonly SessionMessage[]): Shell[] => {
   return [...shells.values()]
 }
 
+// The conversation as plain text for a summary, newest kept when too long.
+const LIMIT = 150_000
+const digest = (messages: readonly SessionMessage[]): string => {
+  const lines = messages.map(message => {
+    const tools = message.toolUses
+      .map(use => `[${use.tool}: ${JSON.stringify(use.input).slice(0, 200)}]`)
+      .join(' ')
+    const text = message.text.length > 4000 ? `${message.text.slice(0, 4000)} …` : message.text
+
+    return `${message.role.toUpperCase()}: ${text} ${tools}`.trim()
+  })
+  const all = lines.join('\n\n')
+
+  return all.length > LIMIT ? `… (earlier part left out)\n${all.slice(-LIMIT)}` : all
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -64,7 +80,8 @@ export const register: Register = on => {
       const agents = (await $.agent.list()).filter(a =>
         ['pending', 'running', 'waiting'].includes(a.status),
       )
-      const shells = runningShells(await $.session.messages())
+      const messages = await $.session.messages()
+      const shells = runningShells(messages)
       const extra = [
         agents.length > 0 &&
           `AGENTS: one bullet per agent below, in this form: "<name>: <what it is actually working on and why, in plain words>":\n` +
@@ -80,6 +97,16 @@ export const register: Register = on => {
           ? PROMPT
           : `${PROMPT}\nAfter NEXT, add these sections as well (they don't count towards the word limit):\n${extra.join('\n')}`
       reply = await $.model.fork({ prompt })
+      // Right after a resume (--continue) the transcript is loaded but no
+      // request has gone out yet, so there is nothing to fork: summarise the
+      // transcript itself instead.
+      if (!reply.isAnswered && reply.reason === 'nothing-to-fork' && messages.length > 0) {
+        reply = await $.model.complete({
+          model: 'sonnet',
+          system: 'You summarise a Claude Code session for the person who ran it.',
+          prompt: `<transcript>\n${digest(messages)}\n</transcript>\n\n${prompt}`,
+        })
+      }
     } finally {
       $.ui.status(undefined)
     }
